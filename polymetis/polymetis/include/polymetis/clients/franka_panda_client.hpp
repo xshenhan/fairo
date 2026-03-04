@@ -5,8 +5,11 @@
 #include "spdlog/spdlog.h"
 #include <array>
 #include <assert.h>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <thread>
 
 #include "yaml-cpp/yaml.h"
@@ -70,6 +73,22 @@ private:
   bool is_safety_controller_active_;
   double margin_cartesian_pos_, margin_joint_pos_, margin_joint_vel_;
   double k_cartesian_pos_, k_joint_pos_, k_joint_vel_;
+
+  // Async gRPC double-buffer: moves gRPC off the 1kHz critical path.
+  // Callback writes state and reads torques via lock-free atomic index swap.
+  // Worker thread does the slow gRPC round-trip in the background.
+  franka::RobotState state_buf_[2];
+  std::atomic<int> state_latest_{0};
+
+  std::array<double, NUM_DOFS> torque_buf_[2];
+  std::atomic<int> torque_latest_{0};
+
+  std::atomic<bool> new_state_ready_{false};
+  std::mutex worker_mtx_;
+  std::condition_variable worker_cv_;
+  std::atomic<bool> worker_running_{true};
+
+  void grpcWorkerLoop();
 
 public:
   /**

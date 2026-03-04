@@ -48,7 +48,7 @@ FrankaTorqueControlClient::FrankaTorqueControlClient(
   readonly_mode_ = config["readonly"].as<bool>();
   if (!mock_franka_) {
     spdlog::info("Connecting to Franka Emika...");
-    robot_ptr_.reset(new franka::Robot(config["robot_ip"].as<std::string>()));
+    robot_ptr_.reset(new franka::Robot(config["robot_ip"].as<std::string>(), franka::RealtimeConfig::kIgnore));
     model_ptr_.reset(new franka::Model(robot_ptr_->loadModel()));
     spdlog::info("Connected.");
   } else {
@@ -126,13 +126,105 @@ FrankaTorqueControlClient::FrankaTorqueControlClient(
   }
 }
 
+void FrankaTorqueControlClient::grpcWorkerLoop() {
+  // Worker thread: runs gRPC calls outside the 1kHz critical path.
+  // Uses its own local protobufs to avoid sharing with the callback.
+  RobotState worker_robot_state;
+  TorqueCommand worker_torque_command;
+
+  // Initialize protobuf repeated fields
+  for (int i = 0; i < NUM_DOFS; i++) {
+    worker_robot_state.add_joint_positions(0.0);
+    worker_robot_state.add_joint_velocities(0.0);
+    worker_robot_state.add_prev_joint_torques_computed(0.0);
+    worker_robot_state.add_prev_joint_torques_computed_safened(0.0);
+    worker_robot_state.add_motor_torques_measured(0.0);
+    worker_robot_state.add_motor_torques_external(0.0);
+    worker_robot_state.add_motor_torques_desired(0.0);
+  }
+
+  while (worker_running_.load(std::memory_order_acquire)) {
+    // Wait for new state from the 1kHz callback
+    {
+      std::unique_lock<std::mutex> lock(worker_mtx_);
+      worker_cv_.wait(lock, [this] {
+        return new_state_ready_.load(std::memory_order_acquire) ||
+               !worker_running_.load(std::memory_order_acquire);
+      });
+    }
+    if (!worker_running_.load(std::memory_order_acquire))
+      break;
+    new_state_ready_.store(false, std::memory_order_release);
+
+    // Read the latest robot state (lock-free: callback writes to other slot)
+    int s_idx = state_latest_.load(std::memory_order_acquire);
+    const franka::RobotState &state = state_buf_[s_idx];
+
+    // Pack protobuf from libfranka state
+    bool prev_command_successful = false;
+    for (int i = 0; i < NUM_DOFS; i++) {
+      worker_robot_state.set_joint_positions(i, state.q[i]);
+      worker_robot_state.set_joint_velocities(i, state.dq[i]);
+      worker_robot_state.set_motor_torques_measured(i, state.tau_J[i]);
+      worker_robot_state.set_motor_torques_external(i,
+                                                     state.tau_ext_hat_filtered[i]);
+      if (!prev_command_successful &&
+          float(state.tau_J_d[i]) !=
+              worker_robot_state.motor_torques_desired(i)) {
+        prev_command_successful = true;
+      }
+      worker_robot_state.set_motor_torques_desired(i, state.tau_J_d[i]);
+    }
+    worker_robot_state.set_prev_command_successful(prev_command_successful);
+    worker_robot_state.set_error_code(bool(state.current_errors));
+    setTimestampToNow(worker_robot_state.mutable_timestamp());
+
+    // gRPC call (the slow part, ~100-300us)
+    grpc::ClientContext context;
+    long int pre_ns = getNanoseconds();
+    auto status =
+        stub_->ControlUpdate(&context, worker_robot_state, &worker_torque_command);
+    long int post_ns = getNanoseconds();
+
+    if (!status.ok()) {
+      spdlog::error("ControlUpdate rpc failed: {}", status.error_message());
+      continue;
+    }
+
+    worker_robot_state.set_prev_controller_latency_ms(
+        float(post_ns - pre_ns) / 1e6);
+
+    // Write computed torques to the inactive buffer, then flip atomically
+    int t_write = 1 - torque_latest_.load(std::memory_order_relaxed);
+    for (int i = 0; i < NUM_DOFS; i++) {
+      torque_buf_[t_write][i] = worker_torque_command.joint_torques(i);
+      worker_robot_state.set_prev_joint_torques_computed(
+          i, worker_torque_command.joint_torques(i));
+    }
+    torque_latest_.store(t_write, std::memory_order_release);
+  }
+}
+
 void FrankaTorqueControlClient::run() {
   // Create callback function that relays information between gRPC server and
-  // robot
+  // robot.
+  // NOTE: gRPC is done asynchronously in a worker thread. The callback only
+  // reads the latest torques from a double-buffer (~1us), keeping it well
+  // within the ~83us timing budget of libfranka < 0.18.0.
   auto control_callback = [&](const franka::RobotState &libfranka_robot_state,
                               franka::Duration) -> franka::Torques {
-    // Compute torque components
-    updateServerCommand(libfranka_robot_state, torque_commanded_);
+    // Post current state to worker thread (lock-free write)
+    int s_write = 1 - state_latest_.load(std::memory_order_relaxed);
+    state_buf_[s_write] = libfranka_robot_state;
+    state_latest_.store(s_write, std::memory_order_release);
+    new_state_ready_.store(true, std::memory_order_release);
+    worker_cv_.notify_one();
+
+    // Read latest torques computed by worker (lock-free read)
+    int t_idx = torque_latest_.load(std::memory_order_acquire);
+    torque_commanded_ = torque_buf_[t_idx];
+
+    // Safety checks (fast, stays in callback)
     checkStateLimits(libfranka_robot_state, torque_safety_);
 
     // Aggregate & clamp torques
@@ -154,6 +246,11 @@ void FrankaTorqueControlClient::run() {
   if (!mock_franka_ && !readonly_mode_) {
     bool is_robot_operational = true;
     while (is_robot_operational) {
+      // Start async gRPC worker thread
+      worker_running_.store(true, std::memory_order_release);
+      std::thread worker_thread(&FrankaTorqueControlClient::grpcWorkerLoop,
+                                this);
+
       // Send lambda function
       try {
         robot_ptr_->control(control_callback, limit_rate_, lpf_cutoff_freq_);
@@ -161,6 +258,12 @@ void FrankaTorqueControlClient::run() {
         spdlog::error("Robot is unable to be controlled: {}", ex.what());
         is_robot_operational = false;
       }
+
+      // Stop worker thread
+      worker_running_.store(false, std::memory_order_release);
+      worker_cv_.notify_one();
+      if (worker_thread.joinable())
+        worker_thread.join();
 
       // Automatic recovery
       spdlog::warn("Performing automatic error recovery. This calls "
